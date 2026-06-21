@@ -1,0 +1,28 @@
+{
+  "rules": [
+    {
+      "pattern": "^IMG_(.*)\\.jpg$",
+      "replacement": "image_\\1",
+      "use_sequence": false
+    },
+    {
+      "pattern": "^photo_.*\\.png$",
+      "replacement": "",
+      "use_sequence": true,
+      "sequence_start": 1,
+      "sequence_padding": 4,
+      "sequence_prefix": "pic_"
+    }
+  ],
+  "recursive": true,
+  "dry_run": false,
+  "checksum_file": "checksums.md5",
+  "ssh": {
+    "host": "example.com",
+    "port": 22,
+    "username": "user",
+    "password": "",
+    "key_file": "~/.ssh/id_rsa",
+    "remote_path": "/path/to/files"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "rules": [
+    {
+      "pattern": "^photo_(.*)\\.jpg$",
+      "replacement": "IMG_\\1",
+      "use_sequence": false
+    }
+  ],
+  "recursive": true,
+  "dry_run": false,
+  "checksum_file": "checksums.md5"
+}
