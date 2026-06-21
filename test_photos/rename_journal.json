@@ -1,0 +1,39 @@
+{
+  "started_at": 1782004274.7640316,
+  "completed_at": 1782004287.6293244,
+  "status": "rolled_back",
+  "entries": [
+    {
+      "operation": "rename",
+      "old_path": "test_photos\\IMG_001.jpg",
+      "new_path": "test_photos\\photo_001.jpg",
+      "timestamp": 1782004274.7660778,
+      "status": "rolled_back",
+      "error": ""
+    },
+    {
+      "operation": "rename",
+      "old_path": "test_photos\\IMG_002.jpg",
+      "new_path": "test_photos\\photo_002.jpg",
+      "timestamp": 1782004274.7660778,
+      "status": "rolled_back",
+      "error": ""
+    },
+    {
+      "operation": "rename",
+      "old_path": "test_photos\\IMG_中文.jpg",
+      "new_path": "test_photos\\photo_003.jpg",
+      "timestamp": 1782004274.7660778,
+      "status": "rolled_back",
+      "error": ""
+    },
+    {
+      "operation": "rename",
+      "old_path": "test_photos\\subdir\\IMG_003.jpg",
+      "new_path": "test_photos\\subdir\\photo_004.jpg",
+      "timestamp": 1782004274.7660778,
+      "status": "rolled_back",
+      "error": ""
+    }
+  ]
+}

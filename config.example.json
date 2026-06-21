@@ -17,12 +17,26 @@
   "recursive": true,
   "dry_run": false,
   "checksum_file": "checksums.md5",
+  "journal_file": "rename_journal.json",
+  "enable_rollback": true,
+  "performance": {
+    "workers": 4,
+    "batch_size": 1000,
+    "stream_processing": true,
+    "md5_chunk_size": 1048576
+  },
   "ssh": {
     "host": "example.com",
     "port": 22,
     "username": "user",
     "password": "",
     "key_file": "~/.ssh/id_rsa",
-    "remote_path": "/path/to/files"
+    "remote_path": "/path/to/files",
+    "connect_timeout": 30,
+    "max_retries": 3,
+    "retry_delay": 2.0,
+    "keepalive_interval": 30,
+    "remote_encoding": "utf-8",
+    "local_encoding": "utf-8"
   }
 }

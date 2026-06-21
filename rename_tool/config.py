@@ -13,6 +13,12 @@ class SSHConfig:
     password: str = ""
     key_file: Optional[str] = None
     remote_path: str = ""
+    connect_timeout: int = 30
+    max_retries: int = 3
+    retry_delay: float = 2.0
+    keepalive_interval: int = 30
+    remote_encoding: str = "utf-8"
+    local_encoding: str = "utf-8"
 
     def validate(self) -> list[str]:
         errors = []
@@ -24,6 +30,14 @@ class SSHConfig:
             errors.append("SSH username is required")
         if self.port <= 0 or self.port > 65535:
             errors.append("SSH port must be between 1 and 65535")
+        if self.connect_timeout <= 0:
+            errors.append("SSH connect timeout must be positive")
+        if self.max_retries < 0:
+            errors.append("SSH max retries must be non-negative")
+        if self.retry_delay < 0:
+            errors.append("SSH retry delay must be non-negative")
+        if self.keepalive_interval < 0:
+            errors.append("SSH keepalive interval must be non-negative")
         return errors
 
 
@@ -53,12 +67,33 @@ class RenameRule:
 
 
 @dataclass
+class PerformanceConfig:
+    workers: int = 4
+    batch_size: int = 1000
+    stream_processing: bool = True
+    md5_chunk_size: int = 1024 * 1024
+
+    def validate(self) -> list[str]:
+        errors = []
+        if self.workers < 1:
+            errors.append("Workers must be at least 1")
+        if self.batch_size < 1:
+            errors.append("Batch size must be at least 1")
+        if self.md5_chunk_size < 1024:
+            errors.append("MD5 chunk size must be at least 1024 bytes")
+        return errors
+
+
+@dataclass
 class RenameConfig:
     rules: list[RenameRule] = field(default_factory=list)
     recursive: bool = True
     dry_run: bool = False
     ssh: Optional[SSHConfig] = None
     checksum_file: str = "checksums.md5"
+    performance: PerformanceConfig = field(default_factory=PerformanceConfig)
+    journal_file: str = "rename_journal.json"
+    enable_rollback: bool = True
 
     def validate(self) -> list[str]:
         errors = []
@@ -70,6 +105,9 @@ class RenameConfig:
                 errors.append(f"Rule {i + 1}: {err}")
         if self.ssh:
             errors.extend(f"SSH: {err}" for err in self.ssh.validate())
+        perf_errors = self.performance.validate()
+        if perf_errors:
+            errors.extend(f"Performance: {err}" for err in perf_errors)
         return errors
 
 
@@ -102,7 +140,21 @@ def load_config(config_path: str) -> RenameConfig:
             password=ssh_data.get("password", ""),
             key_file=ssh_data.get("key_file"),
             remote_path=ssh_data.get("remote_path", ""),
+            connect_timeout=ssh_data.get("connect_timeout", 30),
+            max_retries=ssh_data.get("max_retries", 3),
+            retry_delay=ssh_data.get("retry_delay", 2.0),
+            keepalive_interval=ssh_data.get("keepalive_interval", 30),
+            remote_encoding=ssh_data.get("remote_encoding", "utf-8"),
+            local_encoding=ssh_data.get("local_encoding", "utf-8"),
         )
+
+    perf_data = data.get("performance", {})
+    performance = PerformanceConfig(
+        workers=perf_data.get("workers", 4),
+        batch_size=perf_data.get("batch_size", 1000),
+        stream_processing=perf_data.get("stream_processing", True),
+        md5_chunk_size=perf_data.get("md5_chunk_size", 1024 * 1024),
+    )
 
     config = RenameConfig(
         rules=rules,
@@ -110,6 +162,9 @@ def load_config(config_path: str) -> RenameConfig:
         dry_run=data.get("dry_run", False),
         ssh=ssh_config,
         checksum_file=data.get("checksum_file", "checksums.md5"),
+        performance=performance,
+        journal_file=data.get("journal_file", "rename_journal.json"),
+        enable_rollback=data.get("enable_rollback", True),
     )
 
     errors = config.validate()
