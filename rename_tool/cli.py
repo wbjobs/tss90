@@ -1,9 +1,10 @@
 import argparse
+import json
 import sys
 from pathlib import Path
 
 from .config import RenameConfig, load_config, RenameRule, SSHConfig, PerformanceConfig
-from .renamer import Renamer, RenamePlan, RenameItem
+from .renamer import Renamer, RenamePlan, RenameItem, UndoManager
 from .validator import Validator, ChecksumEntry
 from .journal import JournalManager
 
@@ -45,9 +46,18 @@ def _progress(current: int, total: int, prefix: str = "") -> None:
         sys.stdout.flush()
 
 
+def _local_rename(old_path: str, new_path: str) -> None:
+    old = Path(old_path)
+    new = Path(new_path)
+    if new.exists():
+        raise FileExistsError(f"Target already exists: {new_path}")
+    old.rename(new)
+
+
 def run_local(args: argparse.Namespace, config: RenameConfig) -> int:
     target_path = args.path or "."
     journal_path = str(Path(target_path) / config.journal_file)
+    undo_path = str(Path(target_path) / config.undo_file)
 
     if args.rollback:
         jm = JournalManager(journal_path)
@@ -65,13 +75,6 @@ def run_local(args: argparse.Namespace, config: RenameConfig) -> int:
         def progress(i, total, msg):
             _progress(i, total, msg + " ")
 
-        def _local_rename(o, n):
-            old = Path(o)
-            new = Path(n)
-            if new.exists():
-                raise FileExistsError(f"Target already exists: {n}")
-            old.rename(new)
-
         success, failed = jm.rollback(
             rename_fn=_local_rename,
             progress_cb=progress if not args.quiet else None,
@@ -83,6 +86,9 @@ def run_local(args: argparse.Namespace, config: RenameConfig) -> int:
     print(f"Recursive: {config.recursive}")
     print(f"Dry run: {config.dry_run}")
     print(f"Workers: {config.performance.workers}")
+    rename_workers = getattr(args, "rename_workers", 1)
+    if rename_workers > 1:
+        print(f"Rename workers: {rename_workers} (parallel with dependency sorting)")
 
     renamer = Renamer(config)
 
@@ -116,16 +122,22 @@ def run_local(args: argparse.Namespace, config: RenameConfig) -> int:
                 print("Aborted.")
                 return 0
 
+        um = UndoManager(undo_path)
         jm = JournalManager(journal_path) if config.enable_rollback and not config.dry_run else None
         success, failed = renamer.execute_plan(
             plan,
             journal_manager=jm,
+            undo_manager=um,
             progress_cb=lambda i, t, m: _progress(i, t, m + " ") if not args.quiet else None,
+            parallel=rename_workers,
         )
         if config.dry_run:
             print(f"[DRY RUN] Would rename {success} files")
+            print(f"Undo mapping saved to: {undo_path}")
         else:
             print(f"\nRenamed {success} files, {failed} failed")
+            print(f"Undo mapping saved to: {undo_path}")
+            print(f"Run 'python main.py undo {undo_path}' to revert")
             if failed > 0 and config.enable_rollback:
                 print(f"Journal saved to: {journal_path}")
                 print(f"Run with --rollback to undo successful operations")
@@ -163,6 +175,7 @@ def run_remote(args: argparse.Namespace, config: RenameConfig) -> int:
 
     ssh_config = config.ssh
     journal_path = config.journal_file
+    undo_path = config.undo_file
 
     if args.rollback:
         jm = JournalManager(journal_path)
@@ -192,7 +205,9 @@ def run_remote(args: argparse.Namespace, config: RenameConfig) -> int:
     print(f"Remote path: {ssh_config.remote_path}")
     print(f"Dry run: {config.dry_run}")
     print(f"Remote encoding: {ssh_config.remote_encoding} -> Local: {ssh_config.local_encoding}")
-    print(f"Connection retries: {ssh_config.max_retries}")
+    rename_workers = getattr(args, "rename_workers", 1)
+    if rename_workers > 1:
+        print(f"Rename workers: {rename_workers} (parallel with dependency sorting)")
 
     try:
         with SSHClient(ssh_config) as ssh:
@@ -238,17 +253,24 @@ def run_remote(args: argparse.Namespace, config: RenameConfig) -> int:
                     print("Aborted.")
                     return 0
 
+            um = UndoManager(undo_path)
             if config.dry_run:
-                print("[DRY RUN] Skipping actual execution on remote.")
+                um.write_undo(plan.to_undo_mapping())
+                print(f"[DRY RUN] Skipping actual execution on remote.")
+                print(f"Undo mapping saved to: {undo_path}")
             else:
                 jm = JournalManager(journal_path) if config.enable_rollback else None
                 success, failed = renamer.execute_plan(
                     plan,
                     rename_fn=ssh.rename_file,
                     journal_manager=jm,
+                    undo_manager=um,
                     progress_cb=lambda i, t, m: _progress(i, t, m + " ") if not args.quiet else None,
+                    parallel=rename_workers,
                 )
                 print(f"\nRenamed {success} files on remote server, {failed} failed")
+                print(f"Undo mapping saved to: {undo_path}")
+                print(f"Run 'python main.py undo {undo_path}' to revert")
                 if failed > 0 and config.enable_rollback:
                     print(f"Journal saved to: {journal_path}")
                     print(f"Run with --rollback to undo successful operations")
@@ -288,6 +310,154 @@ def run_remote(args: argparse.Namespace, config: RenameConfig) -> int:
     return 0
 
 
+def run_undo(args: argparse.Namespace) -> int:
+    undo_path = args.undo_file
+    um = UndoManager(undo_path)
+
+    if not um.exists():
+        print(f"ERROR: Undo file not found: {undo_path}")
+        return 1
+
+    try:
+        mapping = um.load_undo()
+    except (ValueError, json.JSONDecodeError) as e:
+        print(f"ERROR: Invalid undo file: {e}")
+        return 1
+
+    if not mapping:
+        print("Undo file is empty, nothing to revert.")
+        return 0
+
+    total = len(mapping)
+    print(f"Found {total} rename operations to undo.")
+
+    if args.preview or args.dry_run:
+        print(f"\n=== Undo Preview ({total} operations) ===\n")
+        show = min(total, 50)
+        for i, entry in enumerate(mapping[:show], 1):
+            old = Path(entry["new_path"]).name
+            new = Path(entry["old_path"]).name
+            print(f"  {i}. {old}  ->  {new}")
+        if total > 50:
+            print(f"  ... and {total - 50} more")
+        print()
+        if args.dry_run:
+            print("[DRY RUN] No changes made.")
+        return 0
+
+    print(f"\n=== Undo Plan ===")
+    print(f"  {total} files will be reverted to their original names.")
+    print()
+
+    if not args.yes:
+        answer = input("Proceed with undo? [y/N]: ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("Aborted.")
+            return 0
+
+    is_remote = args.mode == "remote"
+    rename_fn = None
+    ssh = None
+
+    if is_remote:
+        ssh_config = SSHConfig(
+            host=args.host or "",
+            port=args.port,
+            username=args.user or "",
+            password=args.password or "",
+            key_file=args.key_file,
+            remote_path="",
+            connect_timeout=getattr(args, "connect_timeout", 30),
+            max_retries=getattr(args, "max_retries", 3),
+            retry_delay=getattr(args, "retry_delay", 2.0),
+        )
+        if args.config:
+            try:
+                loaded = load_config(args.config)
+                if loaded.ssh:
+                    ssh_config = loaded.ssh
+            except Exception:
+                pass
+
+        try:
+            from .ssh_client import SSHClient
+            ssh = SSHClient(ssh_config)
+            ssh.connect()
+            rename_fn = ssh.rename_file
+            print("Connected to remote server.")
+        except Exception as e:
+            print(f"ERROR: Failed to connect to remote: {e}")
+            return 1
+
+    success = 0
+    failed = 0
+    rename_workers = getattr(args, "rename_workers", 1)
+
+    reverse_mapping = list(reversed(mapping))
+
+    if rename_workers > 1 and not is_remote and len(reverse_mapping) > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from threading import Lock
+
+        lock = Lock()
+        completed = 0
+
+        with ThreadPoolExecutor(max_workers=rename_workers) as executor:
+            futures = {}
+            for entry in reverse_mapping:
+                future = executor.submit(_local_rename, entry["new_path"], entry["old_path"])
+                futures[future] = entry
+
+            for future in as_completed(futures):
+                entry = futures[future]
+                with lock:
+                    completed += 1
+                try:
+                    future.result()
+                    success += 1
+                    if not args.quiet:
+                        _progress(completed, total, f"{Path(entry['new_path']).name} -> {Path(entry['old_path']).name} ")
+                except Exception as e:
+                    failed += 1
+                    if not args.quiet:
+                        _progress(completed, total, f"FAILED: {e} ")
+    else:
+        for i, entry in enumerate(reverse_mapping, 1):
+            try:
+                if not args.quiet:
+                    old_name = Path(entry["new_path"]).name
+                    new_name = Path(entry["old_path"]).name
+                    _progress(i, total, f"{old_name} -> {new_name} ")
+
+                if rename_fn:
+                    rename_fn(entry["new_path"], entry["old_path"])
+                else:
+                    _local_rename(entry["new_path"], entry["old_path"])
+                success += 1
+            except Exception as e:
+                failed += 1
+                if not args.quiet:
+                    _progress(i, total, f"FAILED: {e} ")
+
+    if ssh:
+        ssh.close()
+
+    if not args.quiet:
+        sys.stdout.write("\n")
+    print(f"Undo complete: {success} succeeded, {failed} failed")
+
+    if success > 0 and not args.dry_run:
+        backup_path = undo_path + ".bak"
+        try:
+            import shutil
+            shutil.move(undo_path, backup_path)
+            print(f"Undo file backed up to: {backup_path}")
+        except Exception:
+            pass
+
+    return 0 if failed == 0 else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="renamer",
@@ -314,8 +484,10 @@ def build_parser() -> argparse.ArgumentParser:
     common_args.add_argument("--no-rollback", action="store_true", help="Disable journal/rollback")
     common_args.add_argument("--journal-file", default="rename_journal.json", help="Journal file path")
     common_args.add_argument("--workers", type=int, default=4, help="Parallel workers for checksums")
+    common_args.add_argument("--rename-workers", type=int, default=1, help="Parallel workers for rename (respects directory dependencies)")
     common_args.add_argument("--batch-size", type=int, default=1000, help="Batch size for progress reporting")
     common_args.add_argument("--md5-chunk", type=int, default=1024 * 1024, help="MD5 chunk size in bytes")
+    common_args.add_argument("--undo-file", default="undo.json", help="Undo mapping file path")
 
     local_parser = subparsers.add_parser("local", parents=[common_args], help="Local mode")
     local_parser.add_argument("path", nargs="?", default=".", help="Target directory")
@@ -334,6 +506,23 @@ def build_parser() -> argparse.ArgumentParser:
     remote_parser.add_argument("--remote-encoding", default="utf-8", help="Remote filesystem encoding")
     remote_parser.add_argument("--local-encoding", default="utf-8", help="Local filesystem encoding")
 
+    undo_parser = subparsers.add_parser("undo", help="Undo last rename operation from undo.json")
+    undo_parser.add_argument("undo_file", help="Path to undo.json file")
+    undo_parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+    undo_parser.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
+    undo_parser.add_argument("--preview", action="store_true", help="Preview undo operations without executing")
+    undo_parser.add_argument("--dry-run", action="store_true", help="Show what would be undone without executing")
+    undo_parser.add_argument("--rename-workers", type=int, default=1, help="Parallel workers for undo rename")
+    undo_parser.add_argument("--host", help="SSH host (for remote undo)")
+    undo_parser.add_argument("--port", type=int, default=22, help="SSH port")
+    undo_parser.add_argument("--user", help="SSH username")
+    undo_parser.add_argument("--password", help="SSH password")
+    undo_parser.add_argument("--key-file", help="SSH private key file")
+    undo_parser.add_argument("--connect-timeout", type=int, default=30, help="SSH connect timeout")
+    undo_parser.add_argument("--max-retries", type=int, default=3, help="SSH max retries")
+    undo_parser.add_argument("--retry-delay", type=float, default=2.0, help="SSH retry delay base")
+    undo_parser.add_argument("-c", "--config", help="Path to config file (for SSH settings)")
+
     return parser
 
 
@@ -342,6 +531,7 @@ def build_config_from_args(args: argparse.Namespace) -> RenameConfig:
         config = RenameConfig(
             rules=[RenameRule(pattern=".*", replacement="\\1")],
             journal_file=getattr(args, "journal_file", "rename_journal.json"),
+            undo_file=getattr(args, "undo_file", "undo.json"),
         )
         if args.mode == "remote":
             config.ssh = SSHConfig(
@@ -398,6 +588,7 @@ def build_config_from_args(args: argparse.Namespace) -> RenameConfig:
             ssh=ssh_config,
             checksum_file=getattr(args, "checksum_file", "checksums.md5"),
             journal_file=getattr(args, "journal_file", "rename_journal.json"),
+            undo_file=getattr(args, "undo_file", "undo.json"),
             enable_rollback=not getattr(args, "no_rollback", False),
         )
 
@@ -406,6 +597,7 @@ def build_config_from_args(args: argparse.Namespace) -> RenameConfig:
         config.performance.batch_size = getattr(args, "batch_size", config.performance.batch_size)
         config.performance.md5_chunk_size = getattr(args, "md5_chunk", config.performance.md5_chunk_size)
         config.journal_file = getattr(args, "journal_file", config.journal_file)
+        config.undo_file = getattr(args, "undo_file", config.undo_file)
         config.enable_rollback = not getattr(args, "no_rollback", config.enable_rollback)
         if config.dry_run is False:
             config.dry_run = getattr(args, "dry_run", False)
@@ -427,6 +619,9 @@ def main() -> int:
     if not args.mode:
         parser.print_help()
         return 1
+
+    if args.mode == "undo":
+        return run_undo(args)
 
     try:
         config = build_config_from_args(args)

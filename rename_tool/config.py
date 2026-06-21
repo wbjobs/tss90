@@ -93,6 +93,7 @@ class RenameConfig:
     checksum_file: str = "checksums.md5"
     performance: PerformanceConfig = field(default_factory=PerformanceConfig)
     journal_file: str = "rename_journal.json"
+    undo_file: str = "undo.json"
     enable_rollback: bool = True
 
     def validate(self) -> list[str]:
